@@ -311,7 +311,7 @@ ESP_PLATFORM:UNINITIALIZED=1
 GEN_FILES:BOOL=
 
 //Git command line client
-GIT_EXECUTABLE:FILEPATH=GIT_EXECUTABLE-NOTFOUND
+GIT_EXECUTABLE:FILEPATH=E:/Git/cmd/git.exe
 
 //IDF Build Target
 IDF_TARGET:STRING=esp32s3
@@ -587,6 +587,8 @@ CMAKE_TAPI-ADVANCED:INTERNAL=1
 CMAKE_VERBOSE_MAKEFILE-ADVANCED:INTERNAL=1
 //Test C_COMPILER_SUPPORTS_WFORMAT_SIGNEDNESS
 C_COMPILER_SUPPORTS_WFORMAT_SIGNEDNESS:INTERNAL=1
+//Details about finding Git
+FIND_PACKAGE_MESSAGE_DETAILS_Git:INTERNAL=[E:/Git/cmd/git.exe][v2.50.1.windows.1()]
 //Details about finding Python3
 FIND_PACKAGE_MESSAGE_DETAILS_Python3:INTERNAL=[G:/Espressif/python_env/idf5.5_py3.11_env/Scripts/python.exe][cfound components: Interpreter ][v3.11.2()]
 //Details about finding Threads

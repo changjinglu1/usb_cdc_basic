@@ -15,6 +15,7 @@
 #include "esp_event.h"
 #include "esp_wifi.h"
 #include "sys/socket.h"
+#include "driver/gpio.h"
 #ifdef CONFIG_ESP32_S3_USB_OTG
 #include "bsp/esp-bsp.h"
 #endif
@@ -25,6 +26,7 @@ static const char *TAG_NVS = "nvs_config";
 static const char *TAG_TCP = "TCP_Client";
 static esp_netif_t *sta_netif = NULL;         // 全局变量，只创建一次
 static EventGroupHandle_t s_wifi_event_group; // 用于 WiFi 连接状态,用于同步“是否已获取 IP”
+static EventGroupHandle_t s_net_event_group;  // 用于网络连接状态,方便LED反映
 
 /* ringbuffer size */
 #define IN_RINGBUF_SIZE (1024 * 1)
@@ -33,11 +35,26 @@ static EventGroupHandle_t s_wifi_event_group; // 用于 WiFi 连接状态,用于
 /* enable interface num */
 #define EXAMPLE_BULK_ITF_NUM 1        // 设备端口数量，默认1个
 #define WIFI_CONNECTED_BIT BIT0       // WiFi 已连接
+#define TCP_CONNECTED_BIT BIT1        // TCP 已连接
+#define LED_GPIO GPIO_NUM_10          // LED GPIO 引脚
 #define STORAGE_NAMESPACE "wifi_info" // NVS 存储空间名称
 #define KEY_SSID "ssid"
 #define KEY_PASSWD "passwd"
 #define SERVER_IP "192.168.196.86" // 替换为 PC 的 IP 地址
-#define SERVER_PORT 1234           // 替换为 PC 的端口号
+#define SERVER_PORT 6666           // 替换为 PC 的端口号
+
+// 状态枚举
+typedef enum
+{
+    NET_STATE_DISCONNECTED = 0, // AP & TCP 都未连
+    NET_STATE_AP_ONLY,          // 只连上 AP
+    NET_STATE_AP_TCP,           // AP & TCP 都已连
+    NET_STATE_MAX
+} net_state_t;
+
+// 三种状态下的LED on/off 时长（毫秒），初始值可随意设
+static uint32_t s_led_on_ms[NET_STATE_MAX] = {200, 800, 1000};
+static uint32_t s_led_off_ms[NET_STATE_MAX] = {200, 800, 0};
 
 /* choose if use user endpoint descriptors */
 #define EXAMPLE_CONFIG_USER_EP_DESC
@@ -119,121 +136,76 @@ static void usb_receive_task(void *param)
 
 void tcp_client_task(void *pvParameters)
 {
-    const TickType_t wait_per_try = pdMS_TO_TICKS(10000);    // 每次等待 Wi-Fi 连接的超时
-    const TickType_t retry_delay_min = pdMS_TO_TICKS(2000);  // 最小重试延时
-    const TickType_t retry_delay_max = pdMS_TO_TICKS(30000); // 最大重试延时
-    TickType_t retry_delay = retry_delay_min;
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, // 等待 Wi-Fi 连接
+                                           WIFI_CONNECTED_BIT,
+                                           pdFALSE,
+                                           pdTRUE,
+                                           pdMS_TO_TICKS(10000)); // 最多等 10 秒
 
     char rx_buffer[128];
-    const char tx_buffer[] = "Hello from ESP32S3";
+    char tx_buffer[] = "Hello from ESP32S3";
+    static const uint8_t tx_frame[] = {0xAA, 0x66, 0x04, 0x01, 0x02, 0x03, 0x04, 0x0A};
+    struct sockaddr_in dest_addr;
+
+    dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(SERVER_PORT);
+
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (sock < 0)
+    {
+        ESP_LOGE(TAG_TCP, "Unable to create socket: errno %d", errno);
+        return;
+    }
+
+    ESP_LOGI(TAG_TCP, "Socket created, connecting to %s:%d", SERVER_IP, SERVER_PORT);
+
+    int err = connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)); // 连接到服务器
+    if (err != 0)
+    {
+        ESP_LOGE(TAG_TCP, "Socket unable to connect: errno %d", errno);
+        close(sock);
+        return;
+    }
+
+    ESP_LOGI(TAG_TCP, "Successfully connected");
+    xEventGroupSetBits(s_net_event_group, TCP_CONNECTED_BIT);
 
     while (1)
     {
-        // 1) 等待 Wi‑Fi 连接，未连接则指数退避延时重试
-        EventBits_t bits = xEventGroupWaitBits(
-            s_wifi_event_group,
-            WIFI_CONNECTED_BIT,
-            pdFALSE, // 不清除位
-            pdTRUE,  // 所有位均需满足
-            wait_per_try);
-
-        if (!(bits & WIFI_CONNECTED_BIT))
+        // int err = send(sock, tx_buffer, strlen(tx_buffer), 0);// 发送数据
+        int err = send(sock, tx_frame, sizeof(tx_frame), 0);
+        if (err < 0)
         {
-            ESP_LOGW(TAG_TCP, "Wi-Fi not connected, retrying...");
-            vTaskDelay(retry_delay);
-            // 指数退避
-            if (retry_delay < retry_delay_max)
-            {
-                TickType_t next = retry_delay * 2;
-                retry_delay = (next > retry_delay_max) ? retry_delay_max : next;
-            }
-            continue; // 回到 for(;;) 继续等待 Wi‑Fi
-        }
-        // 一旦连上，重置退避
-        retry_delay = retry_delay_min;
-
-        // 2) 解析服务器地址
-        struct sockaddr_in dest_addr = {0};
-        dest_addr.sin_family = AF_INET;
-        dest_addr.sin_port = htons(SERVER_PORT);
-        dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
-        if (dest_addr.sin_addr.s_addr == INADDR_NONE)
-        {
-            ESP_LOGE(TAG_TCP, "Invalid SERVER_IP: %s", SERVER_IP);
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            continue;
+            ESP_LOGE(TAG_TCP, "Error occurred during sending: errno %d", errno);
+            break;
         }
 
-        // 3) 建立 socket
-        int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-        if (sock < 0)
+        ESP_LOGI(TAG_TCP, "Message sent");
+
+        int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
+        if (len < 0)
         {
-            ESP_LOGE(TAG_TCP, "Unable to create socket: errno %d", errno);
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            continue;
+            ESP_LOGE(TAG_TCP, "recv failed: errno %d", errno);
+            break;
+        }
+        else if (len == 0)
+        {
+            ESP_LOGI(TAG_TCP, "Connection closed");
+            break;
+        }
+        else
+        {
+            rx_buffer[len] = 0; // Null-terminate
+            ESP_LOGI(TAG_TCP, "Received: %s", rx_buffer);
         }
 
-        // 让 recv 有超时，防止无尽阻塞
-        struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-        ESP_LOGI(TAG_TCP, "Socket created, connecting to %s:%d", SERVER_IP, SERVER_PORT);
-
-        if (connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) != 0)
-        {
-            ESP_LOGE(TAG_TCP, "Socket unable to connect: errno %d", errno);
-            close(sock);
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            continue; // 回到等待 Wi‑Fi/重连流程（此时 Wi‑Fi 仍可能在线）
-        }
-
-        ESP_LOGI(TAG_TCP, "Successfully connected");
-
-        // 4) 会话循环：若 Wi‑Fi 掉线或对端关闭，跳出并重试
-        while (1)
-        {
-            // 若 Wi‑Fi 掉线，主动退出会话循环
-            if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT))
-            {
-                ESP_LOGW(TAG_TCP, "Wi-Fi lost, closing socket and waiting to reconnect");
-                break;
-            }
-
-            int err = send(sock, tx_buffer, strlen(tx_buffer), 0);
-            if (err < 0)
-            {
-                ESP_LOGE(TAG_TCP, "Error occurred during sending: errno %d", errno);
-                break;
-            }
-
-            ESP_LOGI(TAG_TCP, "Message sent");
-
-            int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
-            if (len < 0)
-            {
-                ESP_LOGE(TAG_TCP, "recv failed or timed out: errno %d", errno);
-                // 这里可以选择继续循环（心跳场景）或断开重连
-                break;
-            }
-            else if (len == 0)
-            {
-                ESP_LOGI(TAG_TCP, "Connection closed by peer");
-                break;
-            }
-            else
-            {
-                rx_buffer[len] = 0;
-                ESP_LOGI(TAG_TCP, "Received: %s", rx_buffer);
-            }
-
-            vTaskDelay(pdMS_TO_TICKS(2000));
-        }
-
-        close(sock);
-        // 回到 for(;;) 顶部：若 Wi‑Fi 已断，等待；若仍在线，直接尝试重连服务器
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
 
-    // 一般不退出；如需退出可在外部发任务通知，并在此处 vTaskDelete(NULL);
+    close(sock);
+    xEventGroupClearBits(s_net_event_group, TCP_CONNECTED_BIT);
+    vTaskDelete(NULL);
 }
 
 static void usb_connect_callback(usbh_cdc_handle_t cdc_handle, void *user_data)
@@ -262,12 +234,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, // wifi �
             break;
         case WIFI_EVENT_STA_CONNECTED:
             ESP_LOGI(TAG_WIFI, "WIFI_EVENT_STA_CONNECTED: 已连接到 AP");
+            xEventGroupSetBits(s_net_event_group, WIFI_CONNECTED_BIT);
             break;
         case WIFI_EVENT_STA_DISCONNECTED:
             wifi_event_sta_disconnected_t *d = event_data;
             ESP_LOGW(TAG_WIFI, "断开，reason=%d", d->reason);
             esp_wifi_connect();
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+            xEventGroupClearBits(s_net_event_group, WIFI_CONNECTED_BIT);
             break;
         default:
             ESP_LOGI(TAG_WIFI, "其他 WIFI_EVENT: event_id=%ld", event_id);
@@ -293,7 +267,7 @@ static void init_wifi_sta(void) // 初始化 WiFi STA 模块
 {
     // 1) 创建事件组
     s_wifi_event_group = xEventGroupCreate();
-
+    s_net_event_group = xEventGroupCreate();
     // 2) 底层初始化
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -395,6 +369,57 @@ static esp_err_t load_wifi_information(char *ssid, size_t ssid_len,
     return ret;
 }
 
+void set_led_blink_time(net_state_t state, uint32_t on_ms, uint32_t off_ms) // 动态调整某个状态下的 LED 闪烁参数
+{
+    if (state < NET_STATE_MAX)
+    {
+        s_led_on_ms[state] = on_ms;
+        s_led_off_ms[state] = off_ms;
+    }
+}
+
+static net_state_t get_net_state(void) // 计算当前网络状态
+{
+    EventBits_t bits = xEventGroupGetBits(s_net_event_group);
+    bool wifi_ok = (bits & WIFI_CONNECTED_BIT);
+    bool tcp_ok = (bits & TCP_CONNECTED_BIT);
+
+    if (!wifi_ok)
+    {
+        return NET_STATE_DISCONNECTED;
+    }
+    else if (wifi_ok && !tcp_ok)
+    {
+        return NET_STATE_AP_ONLY;
+    }
+    else
+    {
+        return NET_STATE_AP_TCP;
+    }
+}
+
+static void led_blink_task(void *pv)
+{
+    // 配置 LED GPIO
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+
+    while (1)
+    {
+        net_state_t state = get_net_state();
+        uint32_t on_ms = s_led_on_ms[state];
+        uint32_t off_ms = s_led_off_ms[state];
+
+        // 打开 LED
+        gpio_set_level(LED_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(on_ms));
+
+        // 关闭 LED
+        gpio_set_level(LED_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(off_ms));
+    }
+}
+
 void app_main(void)
 {
 #ifdef CONFIG_ESP32_S3_USB_OTG
@@ -464,13 +489,13 @@ void app_main(void)
     /* Create a task for USB data processing */
     xTaskCreate(usb_receive_task, "usb_rx", 4096, (void *)handle, 2, NULL);
     xTaskCreate(tcp_client_task, "tcp_client", 4096, NULL, 5, NULL);
+    xTaskCreate(led_blink_task, "led_blink", 2048, NULL, tskIDLE_PRIORITY, NULL);
 
     /* Repeatedly sent AT through USB */
     static const uint8_t raw_frame[] = {0xA5, 0xB1, 0x02, 0x00, 0x00};
 
     static const size_t raw_len = sizeof(raw_frame);
     usbh_cdc_write_bytes(handle[0], raw_frame, raw_len, pdMS_TO_TICKS(100));
-    //  usbh_cdc_write_bytes(handle[0], raw_frame, raw_len, pdMS_TO_TICKS(100));
     ESP_LOGI(TAG, "Send itf0 len=%d", raw_len);
     ESP_LOG_BUFFER_HEXDUMP(TAG, raw_frame, raw_len, ESP_LOG_INFO);
     while (1)
