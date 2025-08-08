@@ -36,8 +36,8 @@ static EventGroupHandle_t s_wifi_event_group; // 用于 WiFi 连接状态,用于
 #define STORAGE_NAMESPACE "wifi_info" // NVS 存储空间名称
 #define KEY_SSID "ssid"
 #define KEY_PASSWD "passwd"
-#define SERVER_IP "192.168.50.1" // 替换为 PC 的 IP 地址
-#define SERVER_PORT 1234         // 替换为 PC 的端口号
+#define SERVER_IP "192.168.196.86" // 替换为 PC 的 IP 地址
+#define SERVER_PORT 1234           // 替换为 PC 的端口号
 
 /* choose if use user endpoint descriptors */
 #define EXAMPLE_CONFIG_USER_EP_DESC
@@ -119,78 +119,121 @@ static void usb_receive_task(void *param)
 
 void tcp_client_task(void *pvParameters)
 {
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, // 等待 Wi-Fi 连接
-                                           WIFI_CONNECTED_BIT,
-                                           pdFALSE,
-                                           pdTRUE,
-                                           pdMS_TO_TICKS(10000)); // 最多等 10 秒
-
-    if (!(bits & WIFI_CONNECTED_BIT))
-    {
-        ESP_LOGW(TAG_TCP, "Wi-Fi not connected, aborting TCP task");
-        vTaskDelete(NULL);
-    }
+    const TickType_t wait_per_try = pdMS_TO_TICKS(10000);    // 每次等待 Wi-Fi 连接的超时
+    const TickType_t retry_delay_min = pdMS_TO_TICKS(2000);  // 最小重试延时
+    const TickType_t retry_delay_max = pdMS_TO_TICKS(30000); // 最大重试延时
+    TickType_t retry_delay = retry_delay_min;
 
     char rx_buffer[128];
-    char tx_buffer[] = "Hello from ESP32S3";
-    struct sockaddr_in dest_addr;
-
-    dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(SERVER_PORT);
-
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (sock < 0)
-    {
-        ESP_LOGE(TAG_TCP, "Unable to create socket: errno %d", errno);
-        return;
-    }
-
-    ESP_LOGI(TAG_TCP, "Socket created, connecting to %s:%d", SERVER_IP, SERVER_PORT);
-
-    int err = connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-    if (err != 0)
-    {
-        ESP_LOGE(TAG_TCP, "Socket unable to connect: errno %d", errno);
-        close(sock);
-        return;
-    }
-
-    ESP_LOGI(TAG_TCP, "Successfully connected");
+    const char tx_buffer[] = "Hello from ESP32S3";
 
     while (1)
     {
-        int err = send(sock, tx_buffer, strlen(tx_buffer), 0);
-        if (err < 0)
+        // 1) 等待 Wi‑Fi 连接，未连接则指数退避延时重试
+        EventBits_t bits = xEventGroupWaitBits(
+            s_wifi_event_group,
+            WIFI_CONNECTED_BIT,
+            pdFALSE, // 不清除位
+            pdTRUE,  // 所有位均需满足
+            wait_per_try);
+
+        if (!(bits & WIFI_CONNECTED_BIT))
         {
-            ESP_LOGE(TAG_TCP, "Error occurred during sending: errno %d", errno);
-            break;
+            ESP_LOGW(TAG_TCP, "Wi-Fi not connected, retrying...");
+            vTaskDelay(retry_delay);
+            // 指数退避
+            if (retry_delay < retry_delay_max)
+            {
+                TickType_t next = retry_delay * 2;
+                retry_delay = (next > retry_delay_max) ? retry_delay_max : next;
+            }
+            continue; // 回到 for(;;) 继续等待 Wi‑Fi
+        }
+        // 一旦连上，重置退避
+        retry_delay = retry_delay_min;
+
+        // 2) 解析服务器地址
+        struct sockaddr_in dest_addr = {0};
+        dest_addr.sin_family = AF_INET;
+        dest_addr.sin_port = htons(SERVER_PORT);
+        dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
+        if (dest_addr.sin_addr.s_addr == INADDR_NONE)
+        {
+            ESP_LOGE(TAG_TCP, "Invalid SERVER_IP: %s", SERVER_IP);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
         }
 
-        ESP_LOGI(TAG_TCP, "Message sent");
-
-        int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
-        if (len < 0)
+        // 3) 建立 socket
+        int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+        if (sock < 0)
         {
-            ESP_LOGE(TAG_TCP, "recv failed: errno %d", errno);
-            break;
-        }
-        else if (len == 0)
-        {
-            ESP_LOGI(TAG_TCP, "Connection closed");
-            break;
-        }
-        else
-        {
-            rx_buffer[len] = 0; // Null-terminate
-            ESP_LOGI(TAG_TCP, "Received: %s", rx_buffer);
+            ESP_LOGE(TAG_TCP, "Unable to create socket: errno %d", errno);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        // 让 recv 有超时，防止无尽阻塞
+        struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        ESP_LOGI(TAG_TCP, "Socket created, connecting to %s:%d", SERVER_IP, SERVER_PORT);
+
+        if (connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) != 0)
+        {
+            ESP_LOGE(TAG_TCP, "Socket unable to connect: errno %d", errno);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue; // 回到等待 Wi‑Fi/重连流程（此时 Wi‑Fi 仍可能在线）
+        }
+
+        ESP_LOGI(TAG_TCP, "Successfully connected");
+
+        // 4) 会话循环：若 Wi‑Fi 掉线或对端关闭，跳出并重试
+        while (1)
+        {
+            // 若 Wi‑Fi 掉线，主动退出会话循环
+            if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT))
+            {
+                ESP_LOGW(TAG_TCP, "Wi-Fi lost, closing socket and waiting to reconnect");
+                break;
+            }
+
+            int err = send(sock, tx_buffer, strlen(tx_buffer), 0);
+            if (err < 0)
+            {
+                ESP_LOGE(TAG_TCP, "Error occurred during sending: errno %d", errno);
+                break;
+            }
+
+            ESP_LOGI(TAG_TCP, "Message sent");
+
+            int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
+            if (len < 0)
+            {
+                ESP_LOGE(TAG_TCP, "recv failed or timed out: errno %d", errno);
+                // 这里可以选择继续循环（心跳场景）或断开重连
+                break;
+            }
+            else if (len == 0)
+            {
+                ESP_LOGI(TAG_TCP, "Connection closed by peer");
+                break;
+            }
+            else
+            {
+                rx_buffer[len] = 0;
+                ESP_LOGI(TAG_TCP, "Received: %s", rx_buffer);
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+
+        close(sock);
+        // 回到 for(;;) 顶部：若 Wi‑Fi 已断，等待；若仍在线，直接尝试重连服务器
     }
 
-    close(sock);
-    vTaskDelete(NULL);
+    // 一般不退出；如需退出可在外部发任务通知，并在此处 vTaskDelete(NULL);
 }
 
 static void usb_connect_callback(usbh_cdc_handle_t cdc_handle, void *user_data)
