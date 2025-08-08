@@ -1,0 +1,23 @@
+{
+    "idf.currentSetup": "g:\\ESP\\v5.5\\esp-idf",
+    "idf.portWin": "COM3",
+    "idf.openOcdConfigs": [
+        "board/esp32s3-builtin.cfg"
+    ],
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32s3"
+    },
+    "files.associations": {
+        "freertos.h": "c",
+        "task.h": "c",
+        "esp_log.h": "c",
+        "iot_usbh_cdc.h": "c",
+        "string.h": "c",
+        "stdio.h": "c",
+        "nvs_flash.h": "c",
+        "esp_wifi.h": "c",
+        "esp_event.h": "c",
+        "esp_netif.h": "c",
+        "socket.h": "c"
+    }
+}

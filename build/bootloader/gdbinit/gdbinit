@@ -1,0 +1,2 @@
+source G:/ESPProject/usb_cdc_basic/build/bootloader/gdbinit/symbols
+source G:/ESPProject/usb_cdc_basic/build/bootloader/gdbinit/connect
