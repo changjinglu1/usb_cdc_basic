@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "usb_cdc_basic",
-    "project_version":    "5660421-dirty",
+    "project_version":    "88f450e-dirty",
     "project_path":       "G:/ESPProject/usb_cdc_basic",
     "idf_path":           "G:/ESP/v5.5/esp-idf",
     "build_dir":          "G:/ESPProject/usb_cdc_basic/build",

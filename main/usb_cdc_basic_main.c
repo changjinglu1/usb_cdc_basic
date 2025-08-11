@@ -40,9 +40,11 @@ static EventGroupHandle_t s_net_event_group;  // 用于网络连接状态,方便
 #define STORAGE_NAMESPACE "wifi_info" // NVS 存储空间名称
 #define KEY_SSID "ssid"
 #define KEY_PASSWD "passwd"
-#define SERVER_IP "192.168.196.86" // 替换为 PC 的 IP 地址
-#define SERVER_PORT 6666           // 替换为 PC 的端口号
-
+#define SERVER_IP "192.168.50.1" // 替换为 PC 的 IP 地址
+#define SERVER_PORT 1231         // 替换为 PC 的端口号
+#define FRAME_HEADER0 0xAA
+#define FRAME_HEADER1 0x66
+#define MAX_BUF_SIZE 512
 // 状态枚举
 typedef enum
 {
@@ -61,6 +63,7 @@ static uint32_t s_led_off_ms[NET_STATE_MAX] = {200, 800, 0};
 
 static void wifi_apply_config_and_connect(const wifi_config_t *wifi_cfg);
 static esp_err_t store_wifi_information(const char *ssid, const char *passwd);
+static void process_ringbuf(uint8_t *ringbuf, size_t *p_len, int sockfd);
 
 static void usb_receive_task(void *param)
 {
@@ -142,9 +145,10 @@ void tcp_client_task(void *pvParameters)
                                            pdTRUE,
                                            pdMS_TO_TICKS(10000)); // 最多等 10 秒
 
-    char rx_buffer[128];
-    char tx_buffer[] = "Hello from ESP32S3";
-    static const uint8_t tx_frame[] = {0xAA, 0x66, 0x04, 0x01, 0x02, 0x03, 0x04, 0x0A};
+    uint8_t ringbuf[MAX_BUF_SIZE];
+    size_t ringbuf_len = 0;
+    static const uint8_t tx_frame[] = {0xAA, 0x66, 0x02, 0x80, 0x01, 0x81};
+
     struct sockaddr_in dest_addr;
 
     dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
@@ -173,39 +177,110 @@ void tcp_client_task(void *pvParameters)
 
     while (1)
     {
-        // int err = send(sock, tx_buffer, strlen(tx_buffer), 0);// 发送数据
-        int err = send(sock, tx_frame, sizeof(tx_frame), 0);
-        if (err < 0)
+        uint8_t tmp[128];
+        int len = recv(sock, tmp, sizeof(tmp), 0);
+        if (len <= 0)
         {
-            ESP_LOGE(TAG_TCP, "Error occurred during sending: errno %d", errno);
+            ESP_LOGE(TAG_TCP, "recv failed len=%d, errno=%d", len, errno);
             break;
         }
 
-        ESP_LOGI(TAG_TCP, "Message sent");
+        ESP_LOGI(TAG_TCP, "Raw TCP Data Received (len=%d):", len);
+        ESP_LOG_BUFFER_HEXDUMP(TAG_TCP, tmp, len, ESP_LOG_INFO);
 
-        int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
-        if (len < 0)
+        // 追加到环形缓存
+        if (ringbuf_len + len <= sizeof(ringbuf))
         {
-            ESP_LOGE(TAG_TCP, "recv failed: errno %d", errno);
-            break;
-        }
-        else if (len == 0)
-        {
-            ESP_LOGI(TAG_TCP, "Connection closed");
-            break;
+            memcpy(ringbuf + ringbuf_len, tmp, len);
+            ringbuf_len += len;
         }
         else
         {
-            rx_buffer[len] = 0; // Null-terminate
-            ESP_LOGI(TAG_TCP, "Received: %s", rx_buffer);
+            // 缓存溢出，丢弃所有数据
+            ESP_LOGW(TAG_TCP, "Ring buffer overflow, discarding");
+            ringbuf_len = 0;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        // 解析并应答完整帧
+        process_ringbuf(ringbuf, &ringbuf_len, sock);
     }
 
     close(sock);
     xEventGroupClearBits(s_net_event_group, TCP_CONNECTED_BIT);
     vTaskDelete(NULL);
+}
+
+static void process_ringbuf(uint8_t *ringbuf, size_t *p_len, int sockfd)
+{
+    size_t idx = 0;
+
+    // 报文最小长度：2(header)+1(len)+0(payload)+1(checksum)=4
+    while (*p_len >= 4)
+    {
+        // 1) 查找帧头
+        if (ringbuf[idx] != FRAME_HEADER0 || ringbuf[idx + 1] != FRAME_HEADER1)
+        {
+            // 丢弃第一个字节，继续在下一个位置寻找
+            memmove(ringbuf, ringbuf + 1, --(*p_len));
+            continue;
+        }
+
+        // 2) 读取长度
+        uint8_t payload_len = ringbuf[idx + 2];
+        size_t frame_len = 2 + 1 + payload_len + 1; // hdr(2)+len(1)+payload(p_len)+chk(1)
+
+        // 3) 如果不够一个完整帧，则等待后续数据
+        if (*p_len < frame_len)
+        {
+            break;
+        }
+
+        // 4) 校验和验证
+        uint8_t sum = 0;
+        for (size_t i = 0; i < payload_len; i++)
+        {
+            sum += ringbuf[3 + i];
+        }
+        uint8_t recv_chk = ringbuf[3 + payload_len];
+        if (sum == recv_chk)
+        {
+            // 5) 有效帧，构造并发送应答
+            // 仅针对 payload_len == 2 的情况示例
+            if (payload_len == 2)
+            {
+                uint8_t resp_payload[2] = {0x80, 0x01};
+
+                // 计算校验和
+                uint8_t resp_chk = resp_payload[0] + resp_payload[1];
+
+                // 打包应答帧
+                uint8_t resp_frame[2 + 1 + 2 + 1];
+                size_t off = 0;
+                resp_frame[off++] = FRAME_HEADER0;
+                resp_frame[off++] = FRAME_HEADER1;
+                resp_frame[off++] = 2;
+                resp_frame[off++] = resp_payload[0];
+                resp_frame[off++] = resp_payload[1];
+                resp_frame[off++] = resp_chk;
+
+                // 发送
+                send(sockfd, resp_frame, off, 0);
+            }
+        }
+        else
+        {
+            // 校验失败，可选择日志或丢弃
+            ESP_LOGW(TAG_TCP, "Invalid checksum: expect %02X, recv %02X", sum, recv_chk);
+        }
+
+        // 6) 丢弃已处理帧
+        size_t remain = *p_len - frame_len;
+        if (remain > 0)
+        {
+            memmove(ringbuf, ringbuf + frame_len, remain);
+        }
+        *p_len = remain;
+    }
 }
 
 static void usb_connect_callback(usbh_cdc_handle_t cdc_handle, void *user_data)
