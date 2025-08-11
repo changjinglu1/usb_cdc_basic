@@ -74,6 +74,13 @@ typedef enum
 static uint32_t s_led_on_ms[NET_STATE_MAX] = {200, 800, 1000};
 static uint32_t s_led_off_ms[NET_STATE_MAX] = {200, 800, 0};
 
+#ifndef MIN
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#endif
+#ifndef MAX
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+#endif
+
 /* choose if use user endpoint descriptors */
 #define EXAMPLE_CONFIG_USER_EP_DESC
 
@@ -123,7 +130,7 @@ static void usb_receive_task(void *param)
                     bool ssid_changed = strncmp((char *)current_cfg.sta.ssid, ssid, sizeof(current_cfg.sta.ssid)) != 0;
                     bool passwd_changed = strncmp((char *)current_cfg.sta.password, passwd, sizeof(current_cfg.sta.password)) != 0;
 
-                    if (ssid_changed || passwd_changed)
+                    if (ssid_changed || passwd_changed) // 检查 SSID 或密码是否有变更
                     {
                         ESP_LOGI(TAG_WIFI, "New credentials received, updating NVS and reconnecting...");
                         esp_err_t err = store_wifi_information(ssid, passwd); // 存储到 NVS
@@ -157,75 +164,96 @@ static void usb_receive_task(void *param)
 
 void tcp_client_task(void *pvParameters)
 {
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, // 等待 Wi-Fi 连接
-                                           WIFI_CONNECTED_BIT,
-                                           pdFALSE,
-                                           pdTRUE,
-                                           pdMS_TO_TICKS(10000)); // 最多等 10 秒
+    const TickType_t WIFI_WAIT_TICKS = pdMS_TO_TICKS(10000);
+    const TickType_t RECONNECT_MIN_TICK = pdMS_TO_TICKS(2000);
+    const TickType_t RECONNECT_MAX_TICK = pdMS_TO_TICKS(60000);
 
     uint8_t ringbuf[MAX_BUF_SIZE];
     size_t ringbuf_len = 0;
-    static const uint8_t tx_frame[] = {0xAA, 0x66, 0x02, 0x80, 0x01, 0x81};
+    TickType_t backoff = RECONNECT_MIN_TICK;
 
-    struct sockaddr_in dest_addr;
-
-    dest_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(SERVER_PORT);
-
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (sock < 0)
-    {
-        ESP_LOGE(TAG_TCP, "Unable to create socket: errno %d", errno);
-        return;
-    }
-
-    ESP_LOGI(TAG_TCP, "Socket created, connecting to %s:%d", SERVER_IP, SERVER_PORT);
-
-    int err = connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)); // 连接到服务器
-    if (err != 0)
-    {
-        ESP_LOGE(TAG_TCP, "Socket unable to connect: errno %d", errno);
-        close(sock);
-        return;
-    }
-
-    ESP_LOGI(TAG_TCP, "Successfully connected");
-    xEventGroupSetBits(s_net_event_group, TCP_CONNECTED_BIT);
+    struct sockaddr_in dest_addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = inet_addr(SERVER_IP),
+        .sin_port = htons(SERVER_PORT)};
 
     while (1)
     {
-        uint8_t tmp[128];
-        int len = recv(sock, tmp, sizeof(tmp), 0);
-        if (len <= 0)
+        // 1. 等待 Wi-Fi 连接
+        EventBits_t bits = xEventGroupWaitBits(
+            s_wifi_event_group,
+            WIFI_CONNECTED_BIT,
+            pdFALSE,
+            pdTRUE,
+            WIFI_WAIT_TICKS);
+
+        if (!(bits & WIFI_CONNECTED_BIT))
         {
-            ESP_LOGE(TAG_TCP, "recv failed len=%d, errno=%d", len, errno);
-            break;
+            // 超时未连上 Wi-Fi，继续等待
+            ESP_LOGW(TAG_TCP, "Wi-Fi not ready, retry in %ld ms", backoff);
+            vTaskDelay(backoff);
+            backoff = MIN(backoff * 2, RECONNECT_MAX_TICK);
+            continue;
         }
 
-        ESP_LOGI(TAG_TCP, "Raw TCP Data Received (len=%d):", len);
-        ESP_LOG_BUFFER_HEXDUMP(TAG_TCP, tmp, len, ESP_LOG_INFO);
-
-        // 追加到环形缓存
-        if (ringbuf_len + len <= sizeof(ringbuf))
+        // 2. 创建并连接 Socket
+        int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+        if (sock < 0)
         {
-            memcpy(ringbuf + ringbuf_len, tmp, len);
-            ringbuf_len += len;
-        }
-        else
-        {
-            // 缓存溢出，丢弃所有数据
-            ESP_LOGW(TAG_TCP, "Ring buffer overflow, discarding");
-            ringbuf_len = 0;
+            ESP_LOGE(TAG_TCP, "socket() failed errno=%d", errno);
+            goto reconnect_delay;
         }
 
-        // 解析并应答完整帧
-        process_ringbuf(ringbuf, &ringbuf_len, sock);
+        ESP_LOGI(TAG_TCP, "Connecting to %s:%d", SERVER_IP, SERVER_PORT);
+        if (connect(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) != 0)
+        {
+            ESP_LOGE(TAG_TCP, "connect() failed errno=%d", errno);
+            close(sock);
+            goto reconnect_delay;
+        }
+
+        ESP_LOGI(TAG_TCP, "TCP connected");
+        xEventGroupSetBits(s_net_event_group, TCP_CONNECTED_BIT);
+        backoff = RECONNECT_MIN_TICK; // 重置退避
+
+        // 3. 收发循环
+        while (1)
+        {
+            uint8_t tmp[128];
+            int len = recv(sock, tmp, sizeof(tmp), 0);
+            if (len <= 0)
+            {
+                ESP_LOGE(TAG_TCP, "recv() error len=%d errno=%d", len, errno);
+                break;
+            }
+
+            ESP_LOGI(TAG_TCP, "Received %d bytes", len);
+            ESP_LOG_BUFFER_HEXDUMP(TAG_TCP, tmp, len, ESP_LOG_INFO);
+
+            // 追加到环形缓存并解析
+            if (ringbuf_len + len <= sizeof(ringbuf))
+            {
+                memcpy(ringbuf + ringbuf_len, tmp, len);
+                ringbuf_len += len;
+                process_ringbuf(ringbuf, &ringbuf_len, sock);
+            }
+            else
+            {
+                ESP_LOGW(TAG_TCP, "Ring buffer overflow, clearing");
+                ringbuf_len = 0;
+            }
+        }
+
+        // 4. 断开清理
+        close(sock);
+        xEventGroupClearBits(s_net_event_group, TCP_CONNECTED_BIT);
+
+    reconnect_delay:
+        // 5. 重连延迟（指数退避）
+        ESP_LOGW(TAG_TCP, "Reconnecting in %ld ms", backoff);
+        vTaskDelay(backoff);
+        backoff = MIN(backoff * 2, RECONNECT_MAX_TICK);
     }
-
-    close(sock);
-    xEventGroupClearBits(s_net_event_group, TCP_CONNECTED_BIT);
-    vTaskDelete(NULL);
 }
 
 static void process_ringbuf(uint8_t *ringbuf, size_t *p_len, int sockfd)
@@ -355,7 +383,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, // wifi �
         case WIFI_EVENT_STA_DISCONNECTED:
             wifi_event_sta_disconnected_t *d = event_data;
             ESP_LOGW(TAG_WIFI, "断开，reason=%d", d->reason);
-            esp_wifi_connect();
+            esp_wifi_connect(); // 重新连接
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupClearBits(s_net_event_group, WIFI_CONNECTED_BIT);
             break;
@@ -680,8 +708,8 @@ void app_main(void)
     vTaskSuspend(NULL);
 
     /* Create a task for USB data processing */
-    xTaskCreate(usb_receive_task, "usb_rx", 4096, (void *)handle, 2, NULL);
-    xTaskCreate(tcp_client_task, "tcp_client", 4096, NULL, 5, NULL);
+    xTaskCreate(usb_receive_task, "usb_rx", 4096, (void *)handle, 3, NULL);
+    xTaskCreate(tcp_client_task, "tcp_client", 4096, NULL, 2, NULL);
     xTaskCreate(led_blink_task, "led_blink", 2048, NULL, tskIDLE_PRIORITY, NULL);
 
     /* Repeatedly sent AT through USB */
