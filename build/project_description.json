@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "usb_cdc_basic",
-    "project_version":    "88f450e-dirty",
+    "project_version":    "742eb92-dirty",
     "project_path":       "G:/ESPProject/usb_cdc_basic",
     "idf_path":           "G:/ESP/v5.5/esp-idf",
     "build_dir":          "G:/ESPProject/usb_cdc_basic/build",
@@ -1251,7 +1251,7 @@
             "type": "LIBRARY",
             "lib": "__idf_main",
             "reqs": [],
-            "priv_reqs": [ "usb", "esp_wifi", "esp_event", "nvs_flash", "esp_system", "esp_netif", "lwip", "esp_driver_gpio", "espressif__iot_usbh_cdc" ],
+            "priv_reqs": [ "usb", "esp_wifi", "esp_event", "nvs_flash", "esp_system", "esp_netif", "lwip", "driver", "espressif__iot_usbh_cdc" ],
             "managed_reqs": [],
             "managed_priv_reqs": [ "espressif__iot_usbh_cdc" ],
             "file": "G:/ESPProject/usb_cdc_basic/build/esp-idf/main/libmain.a",
@@ -2953,7 +2953,7 @@
             "dir": "G:/ESPProject/usb_cdc_basic/main",
             "lib": "__idf_main",
             "reqs": [],
-            "priv_reqs": [ "usb", "esp_wifi", "esp_event", "nvs_flash", "esp_system", "esp_netif", "lwip", "esp_driver_gpio", "espressif__iot_usbh_cdc" ],
+            "priv_reqs": [ "usb", "esp_wifi", "esp_event", "nvs_flash", "esp_system", "esp_netif", "lwip", "driver", "espressif__iot_usbh_cdc" ],
             "managed_reqs": [],
             "managed_priv_reqs": [ "espressif__iot_usbh_cdc" ],
             "include_dirs": [ "." ]

@@ -16,6 +16,7 @@
 #include "esp_wifi.h"
 #include "sys/socket.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #ifdef CONFIG_ESP32_S3_USB_OTG
 #include "bsp/esp-bsp.h"
 #endif
@@ -24,6 +25,7 @@ static const char *TAG = "cdc_basic_demo";
 static const char *TAG_WIFI = "wifi_config";
 static const char *TAG_NVS = "nvs_config";
 static const char *TAG_TCP = "TCP_Client";
+static const char *TAG_FAN = "FAN_CTRL";
 static esp_netif_t *sta_netif = NULL;         // 全局变量，只创建一次
 static EventGroupHandle_t s_wifi_event_group; // 用于 WiFi 连接状态,用于同步“是否已获取 IP”
 static EventGroupHandle_t s_net_event_group;  // 用于网络连接状态,方便LED反映
@@ -45,6 +47,20 @@ static EventGroupHandle_t s_net_event_group;  // 用于网络连接状态,方便
 #define FRAME_HEADER0 0xAA
 #define FRAME_HEADER1 0x66
 #define MAX_BUF_SIZE 512
+
+#define GPIO_FAN_PWR (GPIO_NUM_37) // 高侧开关/使能输入（5V 侧逻辑）
+#define GPIO_FAN_PWM (GPIO_NUM_36) // 接到外部 NMOS 栅极或电平转换后的 PWM
+// === PWM 参数（可按需改）===
+#define PWM_FREQ_HZ (25000) // 先用 25 kHz；若异响或不转，试 1000/500 Hz
+#define PWM_RES_BITS (10)   // 10位分辨率：0..1023
+#define PWM_ACTIVE_LOW (1)  // 1=主动低（常见开漏规范）；0=主动高
+#define PWM_TIMER LEDC_TIMER_0
+#define PWM_MODE LEDC_LOW_SPEED_MODE
+#define PWM_CHANNEL LEDC_CHANNEL_0
+
+// ==== fans运行时状态 ====
+static bool s_fan_power_on = false;
+static uint8_t s_duty_percent = 0; // 0..100
 // 状态枚举
 typedef enum
 {
@@ -64,6 +80,8 @@ static uint32_t s_led_off_ms[NET_STATE_MAX] = {200, 800, 0};
 static void wifi_apply_config_and_connect(const wifi_config_t *wifi_cfg);
 static esp_err_t store_wifi_information(const char *ssid, const char *passwd);
 static void process_ringbuf(uint8_t *ringbuf, size_t *p_len, int sockfd);
+static esp_err_t apply_pwm_percent(uint8_t percent);
+static void set_fan_power(bool on);
 
 static void usb_receive_task(void *param)
 {
@@ -248,38 +266,61 @@ static void process_ringbuf(uint8_t *ringbuf, size_t *p_len, int sockfd)
             // 仅针对 payload_len == 2 的情况示例
             if (payload_len == 2)
             {
-                uint8_t resp_payload[2] = {0x80, 0x01};
+                uint8_t *payload = &ringbuf[3];
+                uint8_t cmd = payload[0];  // 第一个字节，Command
+                uint8_t data = payload[1]; // 第二个字节，Data
 
-                // 计算校验和
-                uint8_t resp_chk = resp_payload[0] + resp_payload[1];
+                // 只对 cmd==0x00 && data==0x00 的帧进行回复
+                if (cmd == 0x00 && data == 0x00)
+                {
+                    // 固定填充回复 payload
+                    uint8_t resp_payload[2] = {0x80, 0x01};
+                    // 计算校验和
+                    uint8_t resp_chk = resp_payload[0] + resp_payload[1];
 
-                // 打包应答帧
-                uint8_t resp_frame[2 + 1 + 2 + 1];
-                size_t off = 0;
-                resp_frame[off++] = FRAME_HEADER0;
-                resp_frame[off++] = FRAME_HEADER1;
-                resp_frame[off++] = 2;
-                resp_frame[off++] = resp_payload[0];
-                resp_frame[off++] = resp_payload[1];
-                resp_frame[off++] = resp_chk;
+                    // 打包完整应答帧
+                    uint8_t resp_frame[2 + 1 + 2 + 1];
+                    size_t off = 0;
+                    resp_frame[off++] = FRAME_HEADER0;
+                    resp_frame[off++] = FRAME_HEADER1;
+                    resp_frame[off++] = 2; // length
+                    resp_frame[off++] = resp_payload[0];
+                    resp_frame[off++] = resp_payload[1];
+                    resp_frame[off++] = resp_chk;
 
-                // 发送
-                send(sockfd, resp_frame, off, 0);
+                    // 发送应答
+                    send(sockfd, resp_frame, off, 0);
+                    ESP_LOGI(TAG_TCP, "Raw TCP Data Send (len=%d):", off);
+                    ESP_LOG_BUFFER_HEXDUMP(TAG_TCP, resp_frame, off, ESP_LOG_INFO);
+                }
+                else if (cmd == 0x01)
+                {
+                    if (data > 100)
+                    {
+                        data = 100;
+                    }
+                    // 初始状态：断电，占空比 0%
+                    apply_pwm_percent(0);
+                    set_fan_power(false);
+
+                    set_fan_power(true);
+                    apply_pwm_percent(data); // 设置风扇 PWM 占空比
+                    ESP_LOGI(TAG_TCP, "Set fan power ON, duty=%u%%", data);
+                }
+                else
+                {
+                    // 不是 00 00，可以在这里处理其他命令
+                    ESP_LOGI(TAG_TCP, "Received other CMD/DATA: %02X %02X", cmd, data);
+                }
             }
+            // 6) 丢弃已处理帧
+            size_t remain = *p_len - frame_len;
+            if (remain > 0)
+            {
+                memmove(ringbuf, ringbuf + frame_len, remain);
+            }
+            *p_len = remain;
         }
-        else
-        {
-            // 校验失败，可选择日志或丢弃
-            ESP_LOGW(TAG_TCP, "Invalid checksum: expect %02X, recv %02X", sum, recv_chk);
-        }
-
-        // 6) 丢弃已处理帧
-        size_t remain = *p_len - frame_len;
-        if (remain > 0)
-        {
-            memmove(ringbuf, ringbuf + frame_len, remain);
-        }
-        *p_len = remain;
     }
 }
 
@@ -495,6 +536,81 @@ static void led_blink_task(void *pv)
     }
 }
 
+static inline uint32_t percent_to_duty(uint8_t percent) // 将百分比转换为 PWM 占空比
+{
+    if (percent > 100)
+        percent = 100;
+    uint32_t max_duty = (1u << PWM_RES_BITS) - 1u; // 10位 -> 1023
+    return (uint32_t)((percent * max_duty) / 100u);
+}
+
+static void set_fan_power(bool on) // 设置风扇电源状态
+{
+    s_fan_power_on = on;
+    // 先把PWM置0再断电，或先上电再给PWM，避免毛刺
+    if (!on)
+    {
+        apply_pwm_percent(0);
+        gpio_set_level(GPIO_FAN_PWR, 0); // 断电
+        ESP_LOGI(TAG_FAN, "Power OFF");
+    }
+    else
+    {
+        gpio_set_level(GPIO_FAN_PWR, 1); // 上电
+        // 上电后恢复上次占空比（若为0则静止）
+        apply_pwm_percent(s_duty_percent);
+        ESP_LOGI(TAG_FAN, "Power ON, duty=%u%%", s_duty_percent);
+    }
+}
+
+static esp_err_t apply_pwm_percent(uint8_t percent) // 应用 PWM 占空比
+{
+    s_duty_percent = percent;
+    uint32_t duty = percent_to_duty(percent);
+    esp_err_t err;
+
+    err = ledc_set_duty(PWM_MODE, PWM_CHANNEL, duty);
+    if (err != ESP_OK)
+        return err;
+    err = ledc_update_duty(PWM_MODE, PWM_CHANNEL);
+    return err;
+}
+
+static void fan_gpio_init(void)
+{
+    // 电源控制脚
+    gpio_config_t pwr = {
+        .pin_bit_mask = (1ULL << GPIO_FAN_PWR),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = 0,
+        .pull_down_en = 0,
+        .intr_type = GPIO_INTR_DISABLE};
+    gpio_config(&pwr);
+    gpio_set_level(GPIO_FAN_PWR, 0); // 默认断电
+}
+
+static void ledc_init(void)
+{
+    ledc_timer_config_t timer = {
+        .speed_mode = PWM_MODE,
+        .duty_resolution = PWM_RES_BITS,
+        .timer_num = PWM_TIMER,
+        .freq_hz = PWM_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer));
+
+    ledc_channel_config_t ch = {
+        .gpio_num = GPIO_FAN_PWM,
+        .speed_mode = PWM_MODE,
+        .channel = PWM_CHANNEL,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = PWM_TIMER,
+        .duty = 0,
+        .hpoint = 0};
+    ESP_ERROR_CHECK(ledc_channel_config(&ch));
+}
+
 void app_main(void)
 {
 #ifdef CONFIG_ESP32_S3_USB_OTG
@@ -502,6 +618,8 @@ void app_main(void)
     bsp_usb_host_power_mode(BSP_USB_HOST_POWER_MODE_USB_DEV, true);
 #endif
 
+    fan_gpio_init();
+    ledc_init();
     // 1) 初始化 NVS
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
