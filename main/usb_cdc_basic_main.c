@@ -164,9 +164,8 @@ static void usb_receive_task(void *param)
 
 void tcp_client_task(void *pvParameters)
 {
-    const TickType_t WIFI_WAIT_TICKS = pdMS_TO_TICKS(10000);
     const TickType_t RECONNECT_MIN_TICK = pdMS_TO_TICKS(2000);
-    const TickType_t RECONNECT_MAX_TICK = pdMS_TO_TICKS(60000);
+    const TickType_t RECONNECT_MAX_TICK = pdMS_TO_TICKS(3200);
 
     uint8_t ringbuf[MAX_BUF_SIZE];
     size_t ringbuf_len = 0;
@@ -177,31 +176,24 @@ void tcp_client_task(void *pvParameters)
         .sin_addr.s_addr = inet_addr(SERVER_IP),
         .sin_port = htons(SERVER_PORT)};
 
+    // 1. 一次性等待 Wi-Fi 上线（无限期）
+    xEventGroupWaitBits(
+        s_wifi_event_group,
+        WIFI_CONNECTED_BIT,
+        pdFALSE,      // 保留该位，不要清空
+        pdTRUE,       // 等待全部位，这里只有一个位
+        portMAX_DELAY // 阻塞直到连接上
+    );
+    ESP_LOGI(TAG_TCP, "Wi-Fi connected, enter TCP loop");
+
+    // 2. TCP 连接/重连循环
     while (1)
     {
-        // 1. 等待 Wi-Fi 连接
-        EventBits_t bits = xEventGroupWaitBits(
-            s_wifi_event_group,
-            WIFI_CONNECTED_BIT,
-            pdFALSE,
-            pdTRUE,
-            WIFI_WAIT_TICKS);
-
-        if (!(bits & WIFI_CONNECTED_BIT))
-        {
-            // 超时未连上 Wi-Fi，继续等待
-            ESP_LOGW(TAG_TCP, "Wi-Fi not ready, retry in %ld ms", backoff);
-            vTaskDelay(backoff);
-            backoff = MIN(backoff * 2, RECONNECT_MAX_TICK);
-            continue;
-        }
-
-        // 2. 创建并连接 Socket
         int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
         if (sock < 0)
         {
             ESP_LOGE(TAG_TCP, "socket() failed errno=%d", errno);
-            goto reconnect_delay;
+            goto do_reconnect;
         }
 
         ESP_LOGI(TAG_TCP, "Connecting to %s:%d", SERVER_IP, SERVER_PORT);
@@ -209,14 +201,14 @@ void tcp_client_task(void *pvParameters)
         {
             ESP_LOGE(TAG_TCP, "connect() failed errno=%d", errno);
             close(sock);
-            goto reconnect_delay;
+            goto do_reconnect;
         }
 
         ESP_LOGI(TAG_TCP, "TCP connected");
         xEventGroupSetBits(s_net_event_group, TCP_CONNECTED_BIT);
-        backoff = RECONNECT_MIN_TICK; // 重置退避
+        backoff = RECONNECT_MIN_TICK; // 重置退避时间
 
-        // 3. 收发循环
+        // 3. TCP 收发，直到失败为止
         while (1)
         {
             uint8_t tmp[128];
@@ -230,7 +222,6 @@ void tcp_client_task(void *pvParameters)
             ESP_LOGI(TAG_TCP, "Received %d bytes", len);
             ESP_LOG_BUFFER_HEXDUMP(TAG_TCP, tmp, len, ESP_LOG_INFO);
 
-            // 追加到环形缓存并解析
             if (ringbuf_len + len <= sizeof(ringbuf))
             {
                 memcpy(ringbuf + ringbuf_len, tmp, len);
@@ -244,15 +235,29 @@ void tcp_client_task(void *pvParameters)
             }
         }
 
-        // 4. 断开清理
+        // 4. 掉线清理
         close(sock);
         xEventGroupClearBits(s_net_event_group, TCP_CONNECTED_BIT);
 
-    reconnect_delay:
-        // 5. 重连延迟（指数退避）
+    do_reconnect:
+        // 5. 指数退避等待
         ESP_LOGW(TAG_TCP, "Reconnecting in %ld ms", backoff);
         vTaskDelay(backoff);
         backoff = MIN(backoff * 2, RECONNECT_MAX_TICK);
+
+        // 6. 如果 Wi-Fi 掉线，也重新等待 Wi-Fi
+        if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT))
+        {
+            ESP_LOGW(TAG_TCP, "Wi-Fi lost, wait for reconnect");
+            backoff = RECONNECT_MIN_TICK; // 重置退避
+            xEventGroupWaitBits(
+                s_wifi_event_group,
+                WIFI_CONNECTED_BIT,
+                pdFALSE,
+                pdTRUE,
+                portMAX_DELAY);
+            ESP_LOGI(TAG_TCP, "Wi-Fi reconnected, resume TCP loop");
+        }
     }
 }
 
