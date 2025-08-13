@@ -27,8 +27,10 @@ static const char *TAG_NVS = "nvs_config";
 static const char *TAG_TCP = "TCP_Client";
 static const char *TAG_FAN = "FAN_CTRL";
 static esp_netif_t *sta_netif = NULL;         // 全局变量，只创建一次
-static EventGroupHandle_t s_wifi_event_group; // 用于 WiFi 连接状态,用于同步“是否已获取 IP”
-static EventGroupHandle_t s_net_event_group;  // 用于网络连接状态,方便LED反映
+static EventGroupHandle_t s_wifi_event_group; // Wi-Fi 事件组，只关心 GOT_IP
+static EventGroupHandle_t s_net_event_group;  // TCP 事件组，只关心 TCP 连接成功
+static EventGroupHandle_t s_sys_event_group;  // 系统事件组与配置完成事件位
+static TaskHandle_t s_usb_task_hdl;           // USB 任务句柄，用于恢复任务
 
 /* ringbuffer size */
 #define IN_RINGBUF_SIZE (1024 * 1)
@@ -37,7 +39,7 @@ static EventGroupHandle_t s_net_event_group;  // 用于网络连接状态,方便
 /* enable interface num */
 #define EXAMPLE_BULK_ITF_NUM 1        // 设备端口数量，默认1个
 #define WIFI_CONNECTED_BIT BIT0       // WiFi 已连接
-#define TCP_CONNECTED_BIT BIT1        // TCP 已连接
+#define TCP_CONNECTED_BIT BIT0        // TCP 已连接
 #define LED_GPIO GPIO_NUM_10          // LED GPIO 引脚
 #define STORAGE_NAMESPACE "wifi_info" // NVS 存储空间名称
 #define KEY_SSID "ssid"
@@ -47,6 +49,8 @@ static EventGroupHandle_t s_net_event_group;  // 用于网络连接状态,方便
 #define FRAME_HEADER0 0xAA
 #define FRAME_HEADER1 0x66
 #define MAX_BUF_SIZE 512
+#define CFG_READY_BIT (1 << 2) // 配置完成（无论来自 NVS 还是 USB）
+#define USB_RX_STACK 4096      // 4KB 栈即可
 
 #define GPIO_FAN_PWR (GPIO_NUM_37) // 高侧开关/使能输入（5V 侧逻辑）
 #define GPIO_FAN_PWM (GPIO_NUM_36) // 接到外部 NMOS 栅极或电平转换后的 PWM
@@ -61,6 +65,10 @@ static EventGroupHandle_t s_net_event_group;  // 用于网络连接状态,方便
 // ==== fans运行时状态 ====
 static bool s_fan_power_on = false;
 static uint8_t s_duty_percent = 0; // 0..100
+
+static char usb_buf[IN_RINGBUF_SIZE + 1];                     // 用于累积所有输入
+static usbh_cdc_handle_t s_cdc_handles[EXAMPLE_BULK_ITF_NUM]; // 接口句柄数组
+
 // 状态枚举
 typedef enum
 {
@@ -89,84 +97,165 @@ static esp_err_t store_wifi_information(const char *ssid, const char *passwd);
 static void process_ringbuf(uint8_t *ringbuf, size_t *p_len, int sockfd);
 static esp_err_t apply_pwm_percent(uint8_t percent);
 static void set_fan_power(bool on);
+static esp_err_t load_wifi_information(char *ssid, size_t ssid_len, char *passwd, size_t passwd_len);
+// static void usb_receive_task(void *param)
+// {
+//     usbh_cdc_handle_t *handle = (usbh_cdc_handle_t *)param;
+//     uint8_t buf[IN_RINGBUF_SIZE + 1]; // +1 用于 '\0'
+//     size_t data_len;
 
-static void usb_receive_task(void *param)
+//     while (1)
+//     {
+//         for (size_t i = 0; i < EXAMPLE_BULK_ITF_NUM; i++)
+//         {
+//             // 取可读长度
+//             usbh_cdc_get_rx_buffer_size(handle[i], &data_len);
+//             if (data_len > 0)
+//             {
+//                 // 限制到缓冲区大小，避免越界
+//                 size_t to_read = data_len;
+//                 if (to_read > IN_RINGBUF_SIZE)
+//                 {
+//                     to_read = IN_RINGBUF_SIZE;
+//                 }
+
+//                 // 读取并 NUL 终止
+//                 usbh_cdc_read_bytes(handle[i], buf, &to_read, pdMS_TO_TICKS(100));
+//                 buf[to_read] = '\0';
+
+//                 // 安全打印
+//                 ESP_LOGI(TAG, "Device %d Receive len=%d: %.*s",
+//                          i, (int)to_read, (int)to_read, buf);
+
+//                 char *ssid = strtok((char *)buf, "#");
+//                 char *passwd = strtok(NULL, "#");
+
+//                 if (ssid && passwd)
+//                 {
+//                     wifi_config_t current_cfg = {0};
+//                     esp_wifi_get_config(WIFI_IF_STA, &current_cfg);
+
+//                     bool ssid_changed = strncmp((char *)current_cfg.sta.ssid, ssid, sizeof(current_cfg.sta.ssid)) != 0;
+//                     bool passwd_changed = strncmp((char *)current_cfg.sta.password, passwd, sizeof(current_cfg.sta.password)) != 0;
+
+//                     if (ssid_changed || passwd_changed) // 检查 SSID 或密码是否有变更
+//                     {
+//                         ESP_LOGI(TAG_WIFI, "New credentials received, updating NVS and reconnecting...");
+//                         esp_err_t err = store_wifi_information(ssid, passwd); // 存储到 NVS
+
+//                         if (err == ESP_OK)
+//                         {
+//                             wifi_config_t cfg = {.sta = {{0}}};
+//                             strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
+//                             strncpy((char *)cfg.sta.password, passwd, sizeof(cfg.sta.password) - 1);
+
+//                             wifi_apply_config_and_connect(&cfg);
+//                         }
+
+//                         else
+//                         {
+//                             ESP_LOGE(TAG_WIFI, "Failed to store Wi-Fi credentials to NVS");
+//                         }
+//                     }
+//                     else
+//                     {
+//                         ESP_LOGI(TAG_WIFI, "Received credentials match current config, skipping reconnect.");
+//                     }
+//                 }
+//             }
+
+//             // 让出 CPU，避免看门狗报警
+//             vTaskDelay(pdMS_TO_TICKS(10));
+//         }
+//     }
+// }
+
+static void usb_setup_task(void *param)
 {
-    usbh_cdc_handle_t *handle = (usbh_cdc_handle_t *)param;
-    uint8_t buf[IN_RINGBUF_SIZE + 1]; // +1 用于 '\0'
-    size_t data_len;
+    usbh_cdc_handle_t *h = param;
+    bool updated = false;
+    size_t len = 0;
 
-    while (1)
+    // 1) 读 NVS（局部变量可保留较小 SSID/密码）
+    char nvs_ssid[33] = {0}, nvs_pass[65] = {0};
+    bool have = (load_wifi_information(nvs_ssid, sizeof(nvs_ssid),
+                                       nvs_pass, sizeof(nvs_pass)) == ESP_OK);
+
+    // 2) 等待窗口（5 秒）或命令完成
+    TickType_t end = xTaskGetTickCount() + pdMS_TO_TICKS(5000);
+    TickType_t idle_dead = 0;
+    bool busy = false;
+
+    while (xTaskGetTickCount() < end)
     {
-        for (size_t i = 0; i < EXAMPLE_BULK_ITF_NUM; i++)
+        size_t avail = 0; // 获取可读字节数
+        usbh_cdc_get_rx_buffer_size(h[0], &avail);
+        if (avail)
         {
-            // 取可读长度
-            usbh_cdc_get_rx_buffer_size(handle[i], &data_len);
-            if (data_len > 0)
+            // 读入 usb_buf[len..]
+            size_t to_read = MIN(avail, sizeof(usb_buf) - 1 - len); // 限制到缓冲区大小
+            usbh_cdc_read_bytes(h[0], (uint8_t *)&usb_buf[len], &to_read, pdMS_TO_TICKS(100));
+            len += to_read;
+            usb_buf[len] = '\0';
+            busy = true;
+            idle_dead = xTaskGetTickCount() + pdMS_TO_TICKS(100);
+        }
+        else if (busy && xTaskGetTickCount() >= idle_dead) // 如果上次有输入但现在空闲了
+        {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    // 3) 只在有输入时解析一次
+    if (len)
+    {
+        // 找到首个分隔符
+        char *sep = strchr(usb_buf, '#');
+        if (sep)
+        {
+            *sep = '\0';
+            char *ssid = usb_buf;
+            char *passwd = sep + 1;
+            size_t sl = strnlen(ssid, 33), pl = strnlen(passwd, 65);
+            if (sl && sl < 33 && pl < 65)
             {
-                // 限制到缓冲区大小，避免越界
-                size_t to_read = data_len;
-                if (to_read > IN_RINGBUF_SIZE)
+                bool ch_s = !have || strcmp(nvs_ssid, ssid);
+                bool ch_p = !have || strcmp(nvs_pass, passwd);
+                if (ch_s || ch_p)
                 {
-                    to_read = IN_RINGBUF_SIZE;
-                }
-
-                // 读取并 NUL 终止
-                usbh_cdc_read_bytes(handle[i], buf, &to_read, pdMS_TO_TICKS(100));
-                buf[to_read] = '\0';
-
-                // 安全打印
-                ESP_LOGI(TAG, "Device %d Receive len=%d: %.*s",
-                         i, (int)to_read, (int)to_read, buf);
-
-                char *ssid = strtok((char *)buf, "#");
-                char *passwd = strtok(NULL, "#");
-
-                if (ssid && passwd)
-                {
-                    wifi_config_t current_cfg = {0};
-                    esp_wifi_get_config(WIFI_IF_STA, &current_cfg);
-
-                    bool ssid_changed = strncmp((char *)current_cfg.sta.ssid, ssid, sizeof(current_cfg.sta.ssid)) != 0;
-                    bool passwd_changed = strncmp((char *)current_cfg.sta.password, passwd, sizeof(current_cfg.sta.password)) != 0;
-
-                    if (ssid_changed || passwd_changed) // 检查 SSID 或密码是否有变更
+                    if (store_wifi_information(ssid, passwd) == ESP_OK)
                     {
-                        ESP_LOGI(TAG_WIFI, "New credentials received, updating NVS and reconnecting...");
-                        esp_err_t err = store_wifi_information(ssid, passwd); // 存储到 NVS
-
-                        if (err == ESP_OK)
-                        {
-                            wifi_config_t cfg = {.sta = {{0}}};
-                            strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
-                            strncpy((char *)cfg.sta.password, passwd, sizeof(cfg.sta.password) - 1);
-
-                            wifi_apply_config_and_connect(&cfg);
-                        }
-
-                        else
-                        {
-                            ESP_LOGE(TAG_WIFI, "Failed to store Wi-Fi credentials to NVS");
-                        }
-                    }
-                    else
-                    {
-                        ESP_LOGI(TAG_WIFI, "Received credentials match current config, skipping reconnect.");
+                        wifi_config_t cfg = {0};
+                        strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
+                        strncpy((char *)cfg.sta.password, passwd, sizeof(cfg.sta.password) - 1);
+                        wifi_apply_config_and_connect(&cfg);
+                        updated = true;
                     }
                 }
             }
-
-            // 让出 CPU，避免看门狗报警
-            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
+
+    // 4) 无更新但有旧配置时确保已连接
+    if (!updated && have)
+    {
+        wifi_config_t cfg = {0};
+        strncpy((char *)cfg.sta.ssid, nvs_ssid, sizeof(cfg.sta.ssid) - 1);
+        strncpy((char *)cfg.sta.password, nvs_pass, sizeof(cfg.sta.password) - 1);
+        wifi_apply_config_and_connect(&cfg);
+    }
+
+    xEventGroupSetBits(s_sys_event_group, CFG_READY_BIT);
+    vTaskDelete(NULL);
 }
 
 void tcp_client_task(void *pvParameters)
 {
-    const TickType_t WIFI_WAIT_TICKS = pdMS_TO_TICKS(10000);
+    xEventGroupWaitBits(s_sys_event_group, CFG_READY_BIT,
+                        pdFALSE, pdTRUE, portMAX_DELAY);
     const TickType_t RECONNECT_MIN_TICK = pdMS_TO_TICKS(2000);
-    const TickType_t RECONNECT_MAX_TICK = pdMS_TO_TICKS(60000);
+    const TickType_t RECONNECT_MAX_TICK = pdMS_TO_TICKS(3200);
 
     uint8_t ringbuf[MAX_BUF_SIZE];
     size_t ringbuf_len = 0;
@@ -177,31 +266,24 @@ void tcp_client_task(void *pvParameters)
         .sin_addr.s_addr = inet_addr(SERVER_IP),
         .sin_port = htons(SERVER_PORT)};
 
+    // 1. 一次性等待 Wi-Fi 上线（无限期）
+    xEventGroupWaitBits(
+        s_wifi_event_group,
+        WIFI_CONNECTED_BIT,
+        pdFALSE,      // 保留该位，不要清空
+        pdTRUE,       // 等待全部位，这里只有一个位
+        portMAX_DELAY // 阻塞直到连接上
+    );
+    ESP_LOGI(TAG_TCP, "Wi-Fi connected, enter TCP loop");
+
+    // 2. TCP 连接/重连循环
     while (1)
     {
-        // 1. 等待 Wi-Fi 连接
-        EventBits_t bits = xEventGroupWaitBits(
-            s_wifi_event_group,
-            WIFI_CONNECTED_BIT,
-            pdFALSE,
-            pdTRUE,
-            WIFI_WAIT_TICKS);
-
-        if (!(bits & WIFI_CONNECTED_BIT))
-        {
-            // 超时未连上 Wi-Fi，继续等待
-            ESP_LOGW(TAG_TCP, "Wi-Fi not ready, retry in %ld ms", backoff);
-            vTaskDelay(backoff);
-            backoff = MIN(backoff * 2, RECONNECT_MAX_TICK);
-            continue;
-        }
-
-        // 2. 创建并连接 Socket
         int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
         if (sock < 0)
         {
             ESP_LOGE(TAG_TCP, "socket() failed errno=%d", errno);
-            goto reconnect_delay;
+            goto do_reconnect;
         }
 
         ESP_LOGI(TAG_TCP, "Connecting to %s:%d", SERVER_IP, SERVER_PORT);
@@ -209,14 +291,14 @@ void tcp_client_task(void *pvParameters)
         {
             ESP_LOGE(TAG_TCP, "connect() failed errno=%d", errno);
             close(sock);
-            goto reconnect_delay;
+            goto do_reconnect;
         }
 
         ESP_LOGI(TAG_TCP, "TCP connected");
         xEventGroupSetBits(s_net_event_group, TCP_CONNECTED_BIT);
-        backoff = RECONNECT_MIN_TICK; // 重置退避
+        backoff = RECONNECT_MIN_TICK; // 重置退避时间
 
-        // 3. 收发循环
+        // 3. TCP 收发，直到失败为止
         while (1)
         {
             uint8_t tmp[128];
@@ -230,7 +312,6 @@ void tcp_client_task(void *pvParameters)
             ESP_LOGI(TAG_TCP, "Received %d bytes", len);
             ESP_LOG_BUFFER_HEXDUMP(TAG_TCP, tmp, len, ESP_LOG_INFO);
 
-            // 追加到环形缓存并解析
             if (ringbuf_len + len <= sizeof(ringbuf))
             {
                 memcpy(ringbuf + ringbuf_len, tmp, len);
@@ -244,12 +325,26 @@ void tcp_client_task(void *pvParameters)
             }
         }
 
-        // 4. 断开清理
+        // 4. 掉线清理
         close(sock);
         xEventGroupClearBits(s_net_event_group, TCP_CONNECTED_BIT);
 
-    reconnect_delay:
-        // 5. 重连延迟（指数退避）
+    do_reconnect:
+
+        // 5. 如果 Wi-Fi 掉线，也重新等待 Wi-Fi
+        if (!(xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT))
+        {
+            ESP_LOGW(TAG_TCP, "Wi-Fi lost, wait for reconnect");
+            backoff = RECONNECT_MIN_TICK; // 重置退避
+            xEventGroupWaitBits(
+                s_wifi_event_group,
+                WIFI_CONNECTED_BIT,
+                pdFALSE,
+                pdTRUE,
+                portMAX_DELAY);
+            ESP_LOGI(TAG_TCP, "Wi-Fi reconnected, resume TCP loop");
+        }
+        // 6. 指数退避等待
         ESP_LOGW(TAG_TCP, "Reconnecting in %ld ms", backoff);
         vTaskDelay(backoff);
         backoff = MIN(backoff * 2, RECONNECT_MAX_TICK);
@@ -357,6 +452,11 @@ static void usb_connect_callback(usbh_cdc_handle_t cdc_handle, void *user_data)
     usbh_cdc_desc_print(cdc_handle);
     TaskHandle_t task_hdl = (TaskHandle_t)user_data;
     vTaskResume(task_hdl);
+    static const uint8_t raw_frame[] = {0xA5, 0xB1, 0x02, 0x00, 0x00}; // 发送以获取wifi信息
+    static const size_t raw_len = sizeof(raw_frame);
+    usbh_cdc_write_bytes(s_cdc_handles[0], raw_frame, raw_len, pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "Send itf0 len=%d", raw_len);
+    ESP_LOG_BUFFER_HEXDUMP(TAG, raw_frame, raw_len, ESP_LOG_INFO);
     ESP_LOGI(TAG, "Device Connected!");
 }
 
@@ -378,14 +478,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, // wifi �
             break;
         case WIFI_EVENT_STA_CONNECTED:
             ESP_LOGI(TAG_WIFI, "WIFI_EVENT_STA_CONNECTED: 已连接到 AP");
-            xEventGroupSetBits(s_net_event_group, WIFI_CONNECTED_BIT);
+            xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             break;
         case WIFI_EVENT_STA_DISCONNECTED:
             wifi_event_sta_disconnected_t *d = event_data;
             ESP_LOGW(TAG_WIFI, "断开，reason=%d", d->reason);
             esp_wifi_connect(); // 重新连接
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-            xEventGroupClearBits(s_net_event_group, WIFI_CONNECTED_BIT);
             break;
         default:
             ESP_LOGI(TAG_WIFI, "其他 WIFI_EVENT: event_id=%ld", event_id);
@@ -412,6 +511,8 @@ static void init_wifi_sta(void) // 初始化 WiFi STA 模块
     // 1) 创建事件组
     s_wifi_event_group = xEventGroupCreate();
     s_net_event_group = xEventGroupCreate();
+    s_sys_event_group = xEventGroupCreate();
+
     // 2) 底层初始化
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -462,7 +563,7 @@ static esp_err_t store_wifi_information(const char *ssid, const char *passwd)
     esp_err_t ret = nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &handle); // 打开 NVS 存储空间
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG_WIFI, "NVS open failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG_NVS, "NVS open failed: %s", esp_err_to_name(ret));
         return ret;
     }
     ret = nvs_set_str(handle, KEY_SSID, ssid);
@@ -475,7 +576,7 @@ static esp_err_t store_wifi_information(const char *ssid, const char *passwd)
         ret = nvs_commit(handle);
     }
     nvs_close(handle);
-    ESP_LOGI(TAG_WIFI, "Stored SSID/Passwd to NVS");
+    ESP_LOGI(TAG_NVS, "Stored SSID/Passwd to NVS");
     return ret;
 }
 
@@ -487,14 +588,14 @@ static esp_err_t load_wifi_information(char *ssid, size_t ssid_len,
     esp_err_t ret = nvs_open(STORAGE_NAMESPACE, NVS_READONLY, &handle);
     if (ret != ESP_OK)
     {
-        ESP_LOGW(TAG_WIFI, "No stored Wi-Fi information, error: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG_NVS, "No stored Wi-Fi information, error: %s", esp_err_to_name(ret));
         return ret;
     }
     // 读取 SSID
     ret = nvs_get_str(handle, KEY_SSID, ssid, &ssid_len);
     if (ret != ESP_OK)
     {
-        ESP_LOGE(TAG_WIFI, "Failed to get SSID: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG_NVS, "Failed to get SSID: %s", esp_err_to_name(ret));
     }
     // 读取密码
     if (ret == ESP_OK)
@@ -502,13 +603,13 @@ static esp_err_t load_wifi_information(char *ssid, size_t ssid_len,
         ret = nvs_get_str(handle, KEY_PASSWD, passwd, &passwd_len);
         if (ret != ESP_OK)
         {
-            ESP_LOGE(TAG_WIFI, "Failed to get Passwd: %s", esp_err_to_name(ret));
+            ESP_LOGE(TAG_NVS, "Failed to get Passwd: %s", esp_err_to_name(ret));
         }
     }
     nvs_close(handle);
     if (ret == ESP_OK)
     {
-        ESP_LOGI(TAG_WIFI, "Loaded SSID/Passwd from NVS");
+        ESP_LOGI(TAG_NVS, "Loaded SSID/Passwd from NVS");
     }
     return ret;
 }
@@ -525,8 +626,8 @@ void set_led_blink_time(net_state_t state, uint32_t on_ms, uint32_t off_ms) // �
 static net_state_t get_net_state(void) // 计算当前网络状态
 {
     EventBits_t bits = xEventGroupGetBits(s_net_event_group);
-    bool wifi_ok = (bits & WIFI_CONNECTED_BIT);
-    bool tcp_ok = (bits & TCP_CONNECTED_BIT);
+    bool wifi_ok = xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT;
+    bool tcp_ok = xEventGroupGetBits(s_net_event_group) & TCP_CONNECTED_BIT;
 
     if (!wifi_ok)
     {
@@ -544,6 +645,8 @@ static net_state_t get_net_state(void) // 计算当前网络状态
 
 static void led_blink_task(void *pv)
 {
+    xEventGroupWaitBits(s_sys_event_group, CFG_READY_BIT,
+                        pdFALSE, pdTRUE, portMAX_DELAY);
     // 配置 LED GPIO
     gpio_reset_pin(LED_GPIO);
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
@@ -639,6 +742,38 @@ static void ledc_init(void)
     ESP_ERROR_CHECK(ledc_channel_config(&ch));
 }
 
+static void usb_cdc_init(void)
+{
+    /* install usbh cdc driver with skip_init_usb_host_driver */
+    usbh_cdc_driver_config_t config = {
+        .task_stack_size = 1024 * 4,
+        .task_priority = 5,
+        .task_coreid = 0,
+        .skip_init_usb_host_driver = false,
+    };
+    /* install USB host CDC driver */
+    usbh_cdc_driver_install(&config);
+
+    // usbh_cdc_handle_t handle[EXAMPLE_BULK_ITF_NUM] = {}; // 接口句柄数组
+
+    usbh_cdc_device_config_t dev_config = {
+        .vid = 0,
+        .pid = 0,
+        .itf_num = 0,
+        .rx_buffer_size = IN_RINGBUF_SIZE,
+        .tx_buffer_size = OUT_RINGBUF_SIZE,
+        .cbs = {
+            .connect = usb_connect_callback,
+            .disconnect = usb_disconnect_callback,
+            .user_data = NULL},
+    };
+
+    usbh_cdc_create(&dev_config, &s_cdc_handles[0]);
+    xTaskCreate(usb_setup_task, "usb_rx", USB_RX_STACK, s_cdc_handles, 3, &s_usb_task_hdl);
+    dev_config.cbs.user_data = s_usb_task_hdl;
+    usbh_cdc_create(&dev_config, &s_cdc_handles[0]);
+}
+
 void app_main(void)
 {
 #ifdef CONFIG_ESP32_S3_USB_OTG
@@ -657,46 +792,22 @@ void app_main(void)
     }
 
     init_wifi_sta();
-    // 尝试从 NVS 中加载上次配置
-    char ssid[33] = {0};
-    char passwd[65] = {0};
-    if (load_wifi_information(ssid, sizeof(ssid), passwd, sizeof(passwd)) == ESP_OK)
-    {
-        wifi_config_t cfg = {0};
-        strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
-        strncpy((char *)cfg.sta.password, passwd, sizeof(cfg.sta.password) - 1);
-        wifi_apply_config_and_connect(&cfg);
-    }
-    else
-    {
-        ESP_LOGW(TAG_WIFI, "No saved Wi-Fi config found");
-    }
-    /* install usbh cdc driver with skip_init_usb_host_driver */
-    usbh_cdc_driver_config_t config = {
-        .task_stack_size = 1024 * 4,
-        .task_priority = 5,
-        .task_coreid = 0,
-        .skip_init_usb_host_driver = false,
-    };
-    /* install USB host CDC driver */
-    usbh_cdc_driver_install(&config);
+    // // 尝试从 NVS 中加载上次配置
+    // char ssid[33] = {0};
+    // char passwd[65] = {0};
+    // if (load_wifi_information(ssid, sizeof(ssid), passwd, sizeof(passwd)) == ESP_OK)
+    // {
+    //     wifi_config_t cfg = {0};
+    //     strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
+    //     strncpy((char *)cfg.sta.password, passwd, sizeof(cfg.sta.password) - 1);
+    //     wifi_apply_config_and_connect(&cfg);
+    // }
+    // else
+    // {
+    //     ESP_LOGW(TAG_NVS, "No saved Wi-Fi config found");
+    // }
 
-    usbh_cdc_handle_t handle[EXAMPLE_BULK_ITF_NUM] = {};
-
-    usbh_cdc_device_config_t dev_config = {
-        .vid = 0,
-        .pid = 0,
-        .itf_num = 0,
-        .rx_buffer_size = IN_RINGBUF_SIZE,
-        .tx_buffer_size = OUT_RINGBUF_SIZE,
-        .cbs = {
-            .connect = usb_connect_callback,
-            .disconnect = usb_disconnect_callback,
-            .user_data = xTaskGetCurrentTaskHandle(),
-        },
-    };
-
-    usbh_cdc_create(&dev_config, &handle[0]);
+    usb_cdc_init();
 
 #if (EXAMPLE_BULK_ITF_NUM > 1)
     dev_config.itf_num = 3;
@@ -704,21 +815,18 @@ void app_main(void)
     ESP_LOGI(TAG, "Open interface num: %d with first USB CDC Device", dev_config.itf_num);
     usbh_cdc_create(&dev_config, &handle[1]);
 #endif
-    /*!< Wait for the USB device to be connected */
-    vTaskSuspend(NULL);
 
+    // vTaskSuspend(NULL);
     /* Create a task for USB data processing */
-    xTaskCreate(usb_receive_task, "usb_rx", 4096, (void *)handle, 3, NULL);
+    // static const uint8_t raw_frame[] = {0xA5, 0xB1, 0x02, 0x00, 0x00}; // 发送以获取wifi信息
+    // static const size_t raw_len = sizeof(raw_frame);
+    // usbh_cdc_write_bytes(s_cdc_handles[0], raw_frame, raw_len, pdMS_TO_TICKS(100));
+    // ESP_LOGI(TAG, "Send itf0 len=%d", raw_len);
+    // ESP_LOG_BUFFER_HEXDUMP(TAG, raw_frame, raw_len, ESP_LOG_INFO);
+
     xTaskCreate(tcp_client_task, "tcp_client", 4096, NULL, 2, NULL);
     xTaskCreate(led_blink_task, "led_blink", 2048, NULL, tskIDLE_PRIORITY, NULL);
 
-    /* Repeatedly sent AT through USB */
-    static const uint8_t raw_frame[] = {0xA5, 0xB1, 0x02, 0x00, 0x00};
-
-    static const size_t raw_len = sizeof(raw_frame);
-    usbh_cdc_write_bytes(handle[0], raw_frame, raw_len, pdMS_TO_TICKS(100));
-    ESP_LOGI(TAG, "Send itf0 len=%d", raw_len);
-    ESP_LOG_BUFFER_HEXDUMP(TAG, raw_frame, raw_len, ESP_LOG_INFO);
     while (1)
     {
 
