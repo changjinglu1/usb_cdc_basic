@@ -19,6 +19,7 @@
         "esp_event.h": "c",
         "esp_netif.h": "c",
         "socket.h": "c",
-        "format": "c"
+        "format": "c",
+        "random": "c"
     }
 }

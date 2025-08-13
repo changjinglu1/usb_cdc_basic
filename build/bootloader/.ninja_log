@@ -289,3 +289,10 @@
 15	80	7767587161408123	G:/ESPProject/usb_cdc_basic/build/bootloader/esp-idf/esptool_py/CMakeFiles/bootloader_check_size	7c3cf9182c3574d3
 19	134	7767593615925849	esp-idf/esptool_py/CMakeFiles/bootloader_check_size	7c3cf9182c3574d3
 19	134	7767593615925849	G:/ESPProject/usb_cdc_basic/build/bootloader/esp-idf/esptool_py/CMakeFiles/bootloader_check_size	7c3cf9182c3574d3
+9	93	7767713114726419	esp-idf/esp_bootloader_format/CMakeFiles/__idf_esp_bootloader_format.dir/esp_bootloader_desc.c.obj	ba05f1d66778bcbe
+93	155	7767713115570867	esp-idf/esp_bootloader_format/libesp_bootloader_format.a	8a3ad6ebe331eff9
+155	300	7767713116191732	bootloader.elf	aa71ff43be94ccd2
+300	497	7767713119568664	.bin_timestamp	5af00fadcad0ccb5
+300	497	7767713119568664	G:/ESPProject/usb_cdc_basic/build/bootloader/.bin_timestamp	5af00fadcad0ccb5
+497	580	7767713119618651	esp-idf/esptool_py/CMakeFiles/bootloader_check_size	7c3cf9182c3574d3
+497	580	7767713119618651	G:/ESPProject/usb_cdc_basic/build/bootloader/esp-idf/esptool_py/CMakeFiles/bootloader_check_size	7c3cf9182c3574d3
