@@ -18,6 +18,7 @@
         "esp_wifi.h": "c",
         "esp_event.h": "c",
         "esp_netif.h": "c",
-        "socket.h": "c"
+        "socket.h": "c",
+        "format": "c"
     }
 }
